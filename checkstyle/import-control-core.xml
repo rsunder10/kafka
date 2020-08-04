@@ -38,14 +38,16 @@
   <allow pkg="kafka.serializer" />
   <allow pkg="org.apache.kafka.common" />
 
+  <!-- see KIP-544 for why KafkaYammerMetrics should be used instead of the global default yammer metrics registry
+       https://cwiki.apache.org/confluence/display/KAFKA/KIP-544%3A+Make+metrics+exposed+via+JMX+configurable -->
+  <disallow class="com.yammer.metrics.Metrics" />
+  <allow pkg="com.yammer.metrics"/>
+
   <subpackage name="tools">
     <allow pkg="org.apache.kafka.clients.admin" />
     <allow pkg="kafka.admin" />
     <allow pkg="joptsimple" />
     <allow pkg="org.apache.kafka.clients.consumer" />
-    <allow class="javax.xml.datatype.Duration" />
-    <allow class="javax.xml.datatype.DatatypeFactory" />
-    <allow class="javax.xml.datatype.DatatypeConfigurationException" />
   </subpackage>
 
   <subpackage name="coordinator">

@@ -20,12 +20,12 @@ import signal
 import time
 
 import requests
-from ducktape.cluster.remoteaccount import RemoteCommandError
 from ducktape.errors import DucktapeError
 from ducktape.services.service import Service
 from ducktape.utils.util import wait_until
 
 from kafkatest.directory_layout.kafka_path import KafkaPathResolverMixin
+from kafkatest.services.kafka.util import fix_opts_for_new_jvm
 
 
 class ConnectServiceBase(KafkaPathResolverMixin, Service):
@@ -42,14 +42,17 @@ class ConnectServiceBase(KafkaPathResolverMixin, Service):
     PID_FILE = os.path.join(PERSISTENT_ROOT, "connect.pid")
     EXTERNAL_CONFIGS_FILE = os.path.join(PERSISTENT_ROOT, "connect-external-configs.properties")
     CONNECT_REST_PORT = 8083
+    HEAP_DUMP_FILE = os.path.join(PERSISTENT_ROOT, "connect_heap_dump.bin")
 
-    # Currently the Connect worker supports waiting on three modes:
+    # Currently the Connect worker supports waiting on four modes:
     STARTUP_MODE_INSTANT = 'INSTANT'
     """STARTUP_MODE_INSTANT: Start Connect worker and return immediately"""
     STARTUP_MODE_LOAD = 'LOAD'
     """STARTUP_MODE_LOAD: Start Connect worker and return after discovering and loading plugins"""
     STARTUP_MODE_LISTEN = 'LISTEN'
     """STARTUP_MODE_LISTEN: Start Connect worker and return after opening the REST port."""
+    STARTUP_MODE_JOIN = 'JOIN'
+    """STARTUP_MODE_JOIN: Start Connect worker and return after joining the group."""
 
     logs = {
         "connect_log": {
@@ -61,6 +64,9 @@ class ConnectServiceBase(KafkaPathResolverMixin, Service):
         "connect_stderr": {
             "path": STDERR_FILE,
             "collect_default": True},
+        "connect_heap_dump_file": {
+            "path": HEAP_DUMP_FILE,
+            "collect_default": True}
     }
 
     def __init__(self, context, num_nodes, kafka, files, startup_timeout_sec = 60):
@@ -103,16 +109,17 @@ class ConnectServiceBase(KafkaPathResolverMixin, Service):
 
     def listening(self, node):
         try:
-            cmd = "nc -z %s %s" % (node.account.hostname, self.CONNECT_REST_PORT)
-            node.account.ssh_output(cmd, allow_fail=False)
-            self.logger.debug("Connect worker started accepting connections at: '%s:%s')", node.account.hostname,
+            self.list_connectors(node)
+            self.logger.debug("Connect worker started serving REST at: '%s:%s')", node.account.hostname,
                               self.CONNECT_REST_PORT)
             return True
-        except (RemoteCommandError, ValueError) as e:
+        except requests.exceptions.ConnectionError:
+            self.logger.debug("REST resources are not loaded yet")
             return False
 
-    def start(self, mode=STARTUP_MODE_LISTEN):
-        self.startup_mode = mode
+    def start(self, mode=None):
+        if mode:
+            self.startup_mode = mode
         super(ConnectServiceBase, self).start()
 
     def start_and_return_immediately(self, node, worker_type, remote_connector_configs):
@@ -132,6 +139,15 @@ class ConnectServiceBase(KafkaPathResolverMixin, Service):
         wait_until(lambda: self.listening(node), timeout_sec=self.startup_timeout_sec,
                    err_msg="Kafka Connect failed to start on node: %s in condition mode: %s" %
                    (str(node.account), self.startup_mode))
+
+    def start_and_wait_to_join_group(self, node, worker_type, remote_connector_configs):
+        if worker_type != 'distributed':
+            raise RuntimeError("Cannot wait for joined group message for %s" % worker_type)
+        with node.account.monitor_log(self.LOG_FILE) as monitor:
+            self.start_and_return_immediately(node, worker_type, remote_connector_configs)
+            monitor.wait_until('Joined group', timeout_sec=self.startup_timeout_sec,
+                               err_msg="Never saw message indicating Kafka Connect joined group on node: " +
+                                       "%s in condition mode: %s" % (str(node.account), self.startup_mode))
 
     def stop_node(self, node, clean_shutdown=True):
         self.logger.info((clean_shutdown and "Cleanly" or "Forcibly") + " stopping Kafka Connect on " + str(node.account))
@@ -160,8 +176,8 @@ class ConnectServiceBase(KafkaPathResolverMixin, Service):
     def clean_node(self, node):
         node.account.kill_process("connect", clean_shutdown=False, allow_fail=True)
         self.security_config.clean_node(node)
-        all_files = " ".join([self.CONFIG_FILE, self.LOG4J_CONFIG_FILE, self.PID_FILE, self.LOG_FILE, self.STDOUT_FILE, self.STDERR_FILE, self.EXTERNAL_CONFIGS_FILE] + self.config_filenames() + self.files)
-        node.account.ssh("rm -rf " + all_files, allow_fail=False)
+        other_files = " ".join(self.config_filenames() + self.files)
+        node.account.ssh("rm -rf -- %s %s" % (ConnectServiceBase.PERSISTENT_ROOT, other_files), allow_fail=False)
 
     def config_filenames(self):
         return [os.path.join(self.PERSISTENT_ROOT, "connect-connector-" + str(idx) + ".properties") for idx, template in enumerate(self.connector_config_templates or [])]
@@ -236,7 +252,7 @@ class ConnectServiceBase(KafkaPathResolverMixin, Service):
     def _rest_with_retry(self, path, body=None, node=None, method="GET", retries=40, retry_backoff=.25):
         """
         Invokes a REST API with retries for errors that may occur during normal operation (notably 409 CONFLICT
-        responses that can occur due to rebalancing).
+        responses that can occur due to rebalancing or 404 when the connect resources are not initialized yet).
         """
         exception_to_throw = None
         for i in range(0, retries + 1):
@@ -244,13 +260,21 @@ class ConnectServiceBase(KafkaPathResolverMixin, Service):
                 return self._rest(path, body, node, method)
             except ConnectRestError as e:
                 exception_to_throw = e
-                if e.status != 409:
+                if e.status != 409 and e.status != 404:
                     break
                 time.sleep(retry_backoff)
         raise exception_to_throw
 
     def _base_url(self, node):
         return 'http://' + node.account.externally_routable_ip + ':' + str(self.CONNECT_REST_PORT)
+
+    def append_to_environment_variable(self, envvar, value):
+        env_opts = self.environment[envvar]
+        if env_opts is None:
+            env_opts = "\"%s\"" % value
+        else:
+            env_opts = "\"%s %s\"" % (env_opts.strip('\"'), value)
+        self.environment[envvar] = env_opts
 
 
 class ConnectStandaloneService(ConnectServiceBase):
@@ -266,7 +290,12 @@ class ConnectStandaloneService(ConnectServiceBase):
 
     def start_cmd(self, node, connector_configs):
         cmd = "( export KAFKA_LOG4J_OPTS=\"-Dlog4j.configuration=file:%s\"; " % self.LOG4J_CONFIG_FILE
-        cmd += "export KAFKA_OPTS=%s; " % self.security_config.kafka_opts
+        heap_kafka_opts = "-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=%s" % \
+                          self.logs["connect_heap_dump_file"]["path"]
+        other_kafka_opts = self.security_config.kafka_opts.strip('\"')
+
+        cmd += fix_opts_for_new_jvm(node)
+        cmd += "export KAFKA_OPTS=\"%s %s\"; " % (heap_kafka_opts, other_kafka_opts)
         for envvar in self.environment:
             cmd += "export %s=%s; " % (envvar, str(self.environment[envvar]))
         cmd += "%s %s " % (self.path.script("connect-standalone.sh", node), self.CONFIG_FILE)
@@ -293,6 +322,8 @@ class ConnectStandaloneService(ConnectServiceBase):
             self.start_and_wait_to_load_plugins(node, 'standalone', remote_connector_configs)
         elif self.startup_mode == self.STARTUP_MODE_INSTANT:
             self.start_and_return_immediately(node, 'standalone', remote_connector_configs)
+        elif self.startup_mode == self.STARTUP_MODE_JOIN:
+            self.start_and_wait_to_join_group(node, 'standalone', remote_connector_configs)
         else:
             # The default mode is to wait until the complete startup of the worker
             self.start_and_wait_to_start_listening(node, 'standalone', remote_connector_configs)
@@ -307,6 +338,7 @@ class ConnectDistributedService(ConnectServiceBase):
     def __init__(self, context, num_nodes, kafka, files, offsets_topic="connect-offsets",
                  configs_topic="connect-configs", status_topic="connect-status", startup_timeout_sec = 60):
         super(ConnectDistributedService, self).__init__(context, num_nodes, kafka, files, startup_timeout_sec)
+        self.startup_mode = self.STARTUP_MODE_JOIN
         self.offsets_topic = offsets_topic
         self.configs_topic = configs_topic
         self.status_topic = status_topic
@@ -314,7 +346,10 @@ class ConnectDistributedService(ConnectServiceBase):
     # connector_configs argument is intentionally ignored in distributed service.
     def start_cmd(self, node, connector_configs):
         cmd = "( export KAFKA_LOG4J_OPTS=\"-Dlog4j.configuration=file:%s\"; " % self.LOG4J_CONFIG_FILE
-        cmd += "export KAFKA_OPTS=%s; " % self.security_config.kafka_opts
+        heap_kafka_opts = "-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=%s" % \
+                          self.logs["connect_heap_dump_file"]["path"]
+        other_kafka_opts = self.security_config.kafka_opts.strip('\"')
+        cmd += "export KAFKA_OPTS=\"%s %s\"; " % (heap_kafka_opts, other_kafka_opts)
         for envvar in self.environment:
             cmd += "export %s=%s; " % (envvar, str(self.environment[envvar]))
         cmd += "%s %s " % (self.path.script("connect-distributed.sh", node), self.CONFIG_FILE)
@@ -337,9 +372,11 @@ class ConnectDistributedService(ConnectServiceBase):
             self.start_and_wait_to_load_plugins(node, 'distributed', '')
         elif self.startup_mode == self.STARTUP_MODE_INSTANT:
             self.start_and_return_immediately(node, 'distributed', '')
+        elif self.startup_mode == self.STARTUP_MODE_LISTEN:
+            self.start_and_wait_to_start_listening(node, 'distributed', '')
         else:
             # The default mode is to wait until the complete startup of the worker
-            self.start_and_wait_to_start_listening(node, 'distributed', '')
+            self.start_and_wait_to_join_group(node, 'distributed', '')
 
         if len(self.pids(node)) == 0:
             raise RuntimeError("No process ids recorded")
